@@ -81,6 +81,24 @@ struct client_state {
     uint16_t last_mouse_seq;         /* for mouse-move ordering */
     bool     have_mouse_seq;
 
+    /*
+     * Client-edge return tracking. When enabled, the client integrates the
+     * incoming mouse deltas into an absolute position over its own screen
+     * and, when the cursor reaches the entry edge (opposite the host exit
+     * edge carried in the heartbeat), sends MSG_RELEASE back to the host.
+     */
+    bool     edge_return;            /* --screen-size supplied */
+    double   screen_w;
+    double   screen_h;
+    double   x;                      /* absolute virtual cursor position */
+    double   y;
+    uint8_t  entry_edge;             /* enum ukvm_edge, the host exit edge */
+    bool     have_edge;
+
+    uint16_t tx_seq;                 /* sequence for packets we send back */
+    struct sockaddr_in host_addr;    /* learned from the first valid packet */
+    bool     have_host;
+
     /* Which evdev codes are currently held down. Indexed by evdev code so a
      * single pass can release everything. Covers keys and mouse buttons. */
     uint8_t  down[KEY_CNT];
@@ -225,10 +243,80 @@ static uint16_t button_to_evdev(uint8_t b) {
 }
 
 /* ----------------------------------------------------------------------- */
+/* Return signalling (client-edge method)                                  */
+/* ----------------------------------------------------------------------- */
+
+/*
+ * Send a MSG_RELEASE back to the host. The datagram is header-only; its
+ * payload length is zero, so no encryption is applied (the header travels
+ * in clear in both directions by design). Addressed to the host learned
+ * from the first inbound packet.
+ */
+static void send_release(void) {
+    struct ukvm_header hdr;
+    uint8_t buf[sizeof(hdr)];
+
+    if (!g_state.have_host)
+        return;
+
+    hdr.magic   = g_state.magic;
+    hdr.version = UKVM_VERSION;
+    hdr.type    = MSG_RELEASE;
+    hdr.seq     = g_state.tx_seq++;
+    ukvm_header_hton(&hdr);
+    memcpy(buf, &hdr, sizeof(hdr));
+
+    ssize_t n = sendto(g_state.sock, buf, sizeof(buf), 0,
+                       (struct sockaddr *)&g_state.host_addr,
+                       sizeof(g_state.host_addr));
+    if (n < 0 && errno != EINTR)
+        fprintf(stderr, "ukvm-client: sendto(release): %s\n", strerror(errno));
+}
+
+/*
+ * Integrate a mouse delta into the absolute virtual position and return
+ * true when the cursor has reached the entry edge (the host's exit edge),
+ * meaning control should be handed back. Only meaningful when edge_return
+ * is enabled and the entry edge is known.
+ */
+static bool edge_reached(int16_t dx, int16_t dy) {
+    if (!g_state.edge_return || !g_state.have_edge)
+        return false;
+
+    g_state.x += (double)dx;
+    g_state.y += (double)dy;
+
+    if (g_state.x < 0.0)                   g_state.x = 0.0;
+    if (g_state.x > g_state.screen_w - 1)  g_state.x = g_state.screen_w - 1;
+    if (g_state.y < 0.0)                   g_state.y = 0.0;
+    if (g_state.y > g_state.screen_h - 1)  g_state.y = g_state.screen_h - 1;
+
+    switch (g_state.entry_edge) {
+    case UKVM_EDGE_RIGHT:  return g_state.x <= 0.0;                 /* exit left */
+    case UKVM_EDGE_LEFT:   return g_state.x >= g_state.screen_w - 1.0;
+    case UKVM_EDGE_BOTTOM: return g_state.y <= 0.0;
+    case UKVM_EDGE_TOP:    return g_state.y >= g_state.screen_h - 1.0;
+    default:               return false;
+    }
+}
+
+/* Seed the absolute position at the entry edge when control is grabbed. */
+static void seed_edge_position(void) {
+    switch (g_state.entry_edge) {
+    case UKVM_EDGE_RIGHT:  g_state.x = 0.0;                 g_state.y = g_state.screen_h / 2.0; break;
+    case UKVM_EDGE_LEFT:   g_state.x = g_state.screen_w - 1; g_state.y = g_state.screen_h / 2.0; break;
+    case UKVM_EDGE_BOTTOM: g_state.y = 0.0;                 g_state.x = g_state.screen_w / 2.0; break;
+    case UKVM_EDGE_TOP:    g_state.y = g_state.screen_h - 1; g_state.x = g_state.screen_w / 2.0; break;
+    default: break;
+    }
+}
+
+/* ----------------------------------------------------------------------- */
 /* Packet dispatch                                                         */
 /* ----------------------------------------------------------------------- */
 
-static void handle_packet(uint8_t *buf, size_t len) {
+static void handle_packet(uint8_t *buf, size_t len,
+                          const struct sockaddr_in *from) {
     struct ukvm_header hdr;
 
     if (len < sizeof(hdr))
@@ -238,6 +326,13 @@ static void handle_packet(uint8_t *buf, size_t len) {
 
     if (hdr.magic != g_state.magic || hdr.version != UKVM_VERSION)
         return; /* drop invalid silently */
+
+    /* Learn the host address from the first valid packet so we can send
+     * MSG_RELEASE back to it under the client-edge method. */
+    if (from != NULL && !g_state.have_host) {
+        g_state.host_addr = *from;
+        g_state.have_host = true;
+    }
 
     uint8_t *payload = buf + sizeof(hdr);
     size_t   plen    = len - sizeof(hdr);
@@ -251,12 +346,25 @@ static void handle_packet(uint8_t *buf, size_t len) {
 
     switch (hdr.type) {
     case MSG_HEARTBEAT: {
-        if (plen < sizeof(struct ukvm_heartbeat))
+        /* Tolerate a 1-byte heartbeat (edge absent) for forward compat. */
+        if (plen < 1)
             return;
-        struct ukvm_heartbeat hb;
-        memcpy(&hb, payload, sizeof(hb));
-        if (hb.active) {
+        uint8_t active = payload[0];
+        if (active) {
+            bool was_active = g_state.active;
             g_state.active = true;
+            if (plen >= 2) {
+                uint8_t edge = payload[1];
+                bool edge_changed = !g_state.have_edge ||
+                                    g_state.entry_edge != edge;
+                g_state.entry_edge = edge;
+                g_state.have_edge = true;
+                /* Seed the absolute position when control is first grabbed
+                 * or the entry edge changes, so edge detection starts from
+                 * a known point rather than stale coordinates. */
+                if (g_state.edge_return && (!was_active || edge_changed))
+                    seed_edge_position();
+            }
         } else {
             release_all(); /* clears active */
         }
@@ -282,6 +390,11 @@ static void handle_packet(uint8_t *buf, size_t len) {
         if (m.dx) emit(g_state.uinput_fd, EV_REL, REL_X, m.dx);
         if (m.dy) emit(g_state.uinput_fd, EV_REL, REL_Y, m.dy);
         syn(g_state.uinput_fd);
+
+        /* Client-edge return: if the cursor has reached the entry edge,
+         * tell the host to take control back. */
+        if (edge_reached(m.dx, m.dy))
+            send_release();
         break;
     }
     case MSG_MOUSE_BTN: {
@@ -356,7 +469,12 @@ static void usage(const char *argv0) {
         "  --port    UDP port to listen on (default %u)\n"
         "  --key     32-bit hex magic shared by both ends (default 0x%08X)\n"
         "  --secret  passphrase enabling ChaCha20 payload decryption\n"
-        "            (must match the host's --secret)\n",
+        "            (must match the host's --secret)\n"
+        "  --screen-size WxH  this client's resolution. Enables the\n"
+        "            client-edge return method: the client tracks its own\n"
+        "            cursor and signals the host to take control back when\n"
+        "            the pointer reaches the entry edge. Omit to let the\n"
+        "            host decide when to return control (host-virtual).\n",
         argv0, UKVM_PORT_DEFAULT, UKVM_PORT_DEFAULT, UKVM_MAGIC_DEFAULT);
 }
 
@@ -364,6 +482,7 @@ int main(int argc, char **argv) {
     uint16_t port = UKVM_PORT_DEFAULT;
     uint32_t magic = UKVM_MAGIC_DEFAULT;
     const char *secret = NULL;
+    double screen_w = 0.0, screen_h = 0.0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--port") && i + 1 < argc) {
@@ -372,6 +491,15 @@ int main(int argc, char **argv) {
             magic = (uint32_t)strtoul(argv[++i], NULL, 16);
         } else if (!strcmp(argv[i], "--secret") && i + 1 < argc) {
             secret = argv[++i];
+        } else if (!strcmp(argv[i], "--screen-size") && i + 1 < argc) {
+            unsigned long w = 0, h = 0;
+            if (sscanf(argv[++i], "%lux%lu", &w, &h) != 2 || w == 0 || h == 0) {
+                fprintf(stderr, "ukvm-client: invalid --screen-size "
+                                "(expected WxH, e.g. 1920x1080)\n");
+                return 2;
+            }
+            screen_w = (double)w;
+            screen_h = (double)h;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -384,12 +512,21 @@ int main(int argc, char **argv) {
 
     memset(&g_state, 0, sizeof(g_state));
     g_state.magic = magic;
+    if (screen_w > 0.0 && screen_h > 0.0) {
+        g_state.edge_return = true;
+        g_state.screen_w = screen_w;
+        g_state.screen_h = screen_h;
+    }
     ukvm_derive_key(secret, &g_state.crypto);
     if (!g_state.crypto.enabled)
         fprintf(stderr, "ukvm-client: WARNING encryption disabled "
                         "(no --secret); expecting cleartext\n");
     else
         fprintf(stderr, "ukvm-client: ChaCha20 payload decryption enabled\n");
+
+    fprintf(stderr, "ukvm-client: return method = %s\n",
+            g_state.edge_return ? "client-edge (signals host at edge)"
+                                : "host-virtual (host decides)");
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -441,8 +578,10 @@ int main(int argc, char **argv) {
         if (pr > 0 && (pfd.revents & POLLIN)) {
             for (;;) {
                 uint8_t buf[UKVM_MAX_PACKET];
+                struct sockaddr_in from;
+                socklen_t fromlen = sizeof(from);
                 ssize_t n = recvfrom(g_state.sock, buf, sizeof(buf), 0,
-                                     NULL, NULL);
+                                     (struct sockaddr *)&from, &fromlen);
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK)
                         break;
@@ -452,7 +591,8 @@ int main(int argc, char **argv) {
                     break;
                 }
                 last_rx = t;
-                handle_packet(buf, (size_t)n);
+                handle_packet(buf, (size_t)n,
+                              fromlen == sizeof(from) ? &from : NULL);
             }
         }
 

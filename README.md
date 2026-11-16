@@ -34,8 +34,14 @@ Every datagram is an 8-byte big-endian header followed by a typed payload.
 | seq     | 2    | rolling sequence number                           |
 
 Message types: `MSG_HEARTBEAT` (0x01), `MSG_MOUSE_MOVE` (0x02),
-`MSG_MOUSE_BTN` (0x03), `MSG_MOUSE_SCROLL` (0x04), `MSG_KEY` (0x05).
-All multi-byte integers use network byte order; structs are packed.
+`MSG_MOUSE_BTN` (0x03), `MSG_MOUSE_SCROLL` (0x04), `MSG_KEY` (0x05),
+`MSG_RELEASE` (0x06). All multi-byte integers use network byte order;
+structs are packed.
+
+`MSG_HEARTBEAT` carries `active` (byte 0) and, when active, the host's exit
+`edge` (byte 1), so a client doing its own edge detection knows which
+border returns control. `MSG_RELEASE` travels client->host and is
+header-only; it asks the host to take control back (see below).
 
 Keycodes travel as **USB HID Usage IDs (page 0x07)**. The host maps Carbon
 virtual keycodes to HID; the client maps HID to evdev `KEY_*`.
@@ -111,19 +117,38 @@ start otherwise and prints where to click.
 | `--edge`   | `right`       | screen edge that hands control to the client   |
 | `--key`    | `0x554B564D`  | 32-bit magic shared by both ends               |
 | `--secret` | (none)        | passphrase enabling encryption                 |
-| `--client-size` | host display | client resolution `WxH` for the return boundary |
+| `--return` | `client-edge` | return method: `client-edge` or `host-virtual` |
+| `--client-size` | host display | client resolution `WxH`, host-virtual only |
 
 Push the cursor to the configured edge to hand control to the client; the
 local cursor hides and freezes while raw deltas stream out.
 
 To take control back, move the pointer **back out through the entry edge**
-of the client. Because the host cannot see the client's real cursor, it
-integrates the deltas it sends over a virtual canvas the size of its own
-main display (override with `--client-size 1920x1080` if the client's
-resolution differs) and returns control when that virtual cursor crosses
-back out. For the default `--edge right`, control enters at the client's
-left side, so moving left until you reach it hands control back to the
-host. The **Command + G** failsafe returns control instantly from anywhere.
+of the client. For the default `--edge right`, control enters at the
+client's left side, so moving left until you reach it hands control back.
+The **Command + G** failsafe returns control instantly from anywhere.
+
+### Return methods
+
+The host cannot observe the client's real cursor, so there are two ways to
+decide when the pointer has left the client:
+
+- **`client-edge` (default).** The client tracks its own absolute cursor
+  from the deltas it receives and sends a `MSG_RELEASE` back to the host
+  when the pointer reaches the entry edge. Accurate, because the client
+  knows its own resolution and applies the same motion the user sees. It
+  requires the client to be started with `--screen-size WxH`; if the
+  client is not given a screen size it will not signal, and you should use
+  `host-virtual` instead.
+- **`host-virtual`.** The host integrates the deltas it sends over a
+  virtual canvas (sized from `--client-size`, or its own display by
+  default) and returns control when that estimate recrosses the entry
+  edge. Needs no cooperation from the client, but it is only an estimate
+  and can drift from the client's real cursor over a long session.
+
+Both ends should agree: run the host with `--return client-edge` (default)
+and the client with `--screen-size`, or run the host with
+`--return host-virtual` and omit the client's `--screen-size`.
 
 ### FreeBSD client
 
@@ -144,6 +169,12 @@ kldload uinput
 | `--port`   | `24800`       | UDP port to listen on                    |
 | `--key`    | `0x554B564D`  | 32-bit magic, must match the host        |
 | `--secret` | (none)        | passphrase, must match the host          |
+| `--screen-size` | (none)   | this client's resolution `WxH`; enables the `client-edge` return method |
+
+Pass `--screen-size 1920x1080` (your FreeBSD display's resolution) to use
+the default `client-edge` return method, where the client detects its own
+edge and signals the host. Omit it only when the host is run with
+`--return host-virtual`.
 
 The client creates a virtual HID named `ukvm-virtual-hid` and injects the
 received input. On exit it releases all held keys and destroys the device.

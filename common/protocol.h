@@ -41,7 +41,21 @@ enum ukvm_msg_type {
     MSG_MOUSE_MOVE   = 0x02,
     MSG_MOUSE_BTN    = 0x03,
     MSG_MOUSE_SCROLL = 0x04,
-    MSG_KEY          = 0x05
+    MSG_KEY          = 0x05,
+    MSG_RELEASE      = 0x06  /* client -> host: return control to the host */
+};
+
+/*
+ * Screen edge that transfers control. Carried host -> client in the
+ * heartbeat so the client knows which of its own edges, when the cursor
+ * reaches it, means "leave and hand control back". The value is the host's
+ * exit edge; the client's entry edge is the opposite side.
+ */
+enum ukvm_edge {
+    UKVM_EDGE_LEFT   = 0,
+    UKVM_EDGE_RIGHT  = 1,
+    UKVM_EDGE_TOP    = 2,
+    UKVM_EDGE_BOTTOM = 3
 };
 
 /* Mouse button identifiers used by MSG_MOUSE_BTN. */
@@ -76,10 +90,22 @@ struct __attribute__((packed)) ukvm_header {
     uint16_t seq;     /* rolling sequence number */
 };
 
-/* MSG_HEARTBEAT payload. */
+/*
+ * MSG_HEARTBEAT payload.
+ *
+ * The first byte, `active`, is the original single-byte heartbeat and is
+ * always present. The second byte, `edge`, carries the host's exit edge
+ * (enum ukvm_edge) so a client doing its own edge detection knows which of
+ * its borders returns control. A receiver must tolerate a 1-byte heartbeat
+ * (edge absent) for forward compatibility and treat the edge as unknown in
+ * that case.
+ */
 struct __attribute__((packed)) ukvm_heartbeat {
     uint8_t active; /* 1 = client grabbed/active, 0 = released/inactive */
+    uint8_t edge;   /* enum ukvm_edge: host exit edge (valid when active) */
 };
+
+/* MSG_RELEASE has no payload; the header alone carries the intent. */
 
 /* MSG_MOUSE_MOVE payload: relative delta. */
 struct __attribute__((packed)) ukvm_mouse_move {

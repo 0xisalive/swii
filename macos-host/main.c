@@ -42,11 +42,24 @@
 
 enum edge { EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM };
 
+/*
+ * How control is returned from the client to the host:
+ *   RETURN_CLIENT_EDGE   the client tracks its own absolute cursor and
+ *                        sends MSG_RELEASE when it reaches the entry edge
+ *                        (accurate; the default).
+ *   RETURN_HOST_VIRTUAL  the host integrates forwarded deltas over a
+ *                        virtual canvas and returns when the virtual
+ *                        cursor recrosses the entry edge (no client
+ *                        cooperation, but only an estimate).
+ */
+enum return_mode { RETURN_CLIENT_EDGE, RETURN_HOST_VIRTUAL };
+
 struct host_state {
     int                   sock;
     struct sockaddr_in    dst;
     uint32_t              magic;
     enum edge             edge;
+    enum return_mode      ret_mode;
     struct ukvm_chacha_ctx crypto;
 
     volatile bool         remote;    /* true while control is on the client */
@@ -123,8 +136,20 @@ static void ukvm_send(uint8_t type, const void *payload, size_t payload_len) {
         fprintf(stderr, "ukvm-host: sendto: %s\n", strerror(errno));
 }
 
+/* Map the host's internal edge enum to the wire enum ukvm_edge. */
+static uint8_t edge_to_wire(enum edge e) {
+    switch (e) {
+    case EDGE_LEFT:   return UKVM_EDGE_LEFT;
+    case EDGE_RIGHT:  return UKVM_EDGE_RIGHT;
+    case EDGE_TOP:    return UKVM_EDGE_TOP;
+    case EDGE_BOTTOM: return UKVM_EDGE_BOTTOM;
+    }
+    return UKVM_EDGE_RIGHT;
+}
+
 static void send_heartbeat(uint8_t active) {
-    struct ukvm_heartbeat hb = { .active = active };
+    struct ukvm_heartbeat hb = { .active = active,
+                                 .edge = edge_to_wire(g_state.edge) };
     ukvm_send(MSG_HEARTBEAT, &hb, sizeof(hb));
 }
 
@@ -344,12 +369,14 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
         int64_t dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
         send_mouse_move((int16_t)dx, (int16_t)dy);
         /*
-         * Track the virtual position. If the pointer has walked back out
-         * through the entry edge, hand control back to the host. The delta
-         * that triggers the crossing is still forwarded above so the client
-         * cursor settles against its edge rather than stopping short.
+         * In host-virtual mode, integrate the delta and return control when
+         * the virtual cursor walks back out through the entry edge. The
+         * triggering delta is still forwarded above so the client cursor
+         * settles against its edge. In client-edge mode the client owns the
+         * decision and signals via MSG_RELEASE instead.
          */
-        if (virtual_move_returns((int16_t)dx, (int16_t)dy))
+        if (g_state.ret_mode == RETURN_HOST_VIRTUAL &&
+            virtual_move_returns((int16_t)dx, (int16_t)dy))
             enter_local();
         return NULL;
     }
@@ -412,6 +439,47 @@ static void *heartbeat_thread(void *arg) {
     return NULL;
 }
 
+/* ----------------------------------------------------------------------- */
+/* Release-receiver thread                                                 */
+/* ----------------------------------------------------------------------- */
+/*
+ * The default return method has the client detect its own edge and send a
+ * MSG_RELEASE back to us. The CGEventTap runs on the main run loop, so this
+ * thread only reads the socket and schedules the state transition back onto
+ * the main run loop (via CFRunLoopPerformBlock) to keep all state changes
+ * serialized on one thread.
+ */
+static CFRunLoopRef g_main_runloop;
+
+static void *release_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint8_t buf[UKVM_MAX_PACKET];
+        ssize_t n = recvfrom(g_state.sock, buf, sizeof(buf), 0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if ((size_t)n < sizeof(struct ukvm_header))
+            continue;
+
+        struct ukvm_header hdr;
+        memcpy(&hdr, buf, sizeof(hdr));
+        ukvm_header_ntoh(&hdr);
+        if (hdr.magic != g_state.magic || hdr.version != UKVM_VERSION)
+            continue;
+
+        if (hdr.type == MSG_RELEASE && g_state.remote) {
+            CFRunLoopPerformBlock(g_main_runloop, kCFRunLoopCommonModes, ^{
+                enter_local();
+            });
+            CFRunLoopWakeUp(g_main_runloop);
+        }
+    }
+    return NULL;
+}
+
 #endif /* __APPLE__ */
 
 /* ----------------------------------------------------------------------- */
@@ -428,12 +496,20 @@ static void usage(const char *argv0) {
         "  --edge     screen edge that transfers control (default right)\n"
         "  --key      32-bit hex magic shared by both ends (default 0x%08X)\n"
         "  --secret   passphrase enabling ChaCha20 payload encryption\n"
-        "  --client-size WxH  client resolution for the return boundary\n"
-        "             (default: this host's main display size)\n"
+        "  --return   control-return method: client-edge (default) or\n"
+        "             host-virtual\n"
+        "  --client-size WxH  client resolution for the host-virtual\n"
+        "             boundary (default: this host's main display size)\n"
         "\n"
         "  Control returns to the host when the pointer crosses back out\n"
         "  through the entry edge (e.g. the client's left side for --edge\n"
-        "  right), or at any time with the Command+G failsafe.\n",
+        "  right), or at any time with the Command+G failsafe.\n"
+        "\n"
+        "  client-edge:  the client tracks its own cursor and signals when\n"
+        "                it reaches the edge (accurate; needs the client's\n"
+        "                --screen-size).\n"
+        "  host-virtual: the host estimates from forwarded deltas and does\n"
+        "                not need the client to cooperate (approximate).\n",
         argv0, UKVM_PORT_DEFAULT, UKVM_PORT_DEFAULT, UKVM_MAGIC_DEFAULT);
 }
 
@@ -451,6 +527,7 @@ int main(int argc, char **argv) {
     uint16_t port = UKVM_PORT_DEFAULT;
     uint32_t magic = UKVM_MAGIC_DEFAULT;
     enum edge edge = EDGE_RIGHT;
+    enum return_mode ret_mode = RETURN_CLIENT_EDGE;
     double client_w = 0.0, client_h = 0.0; /* 0 = fall back to host display */
 
     for (int i = 1; i < argc; i++) {
@@ -467,6 +544,17 @@ int main(int argc, char **argv) {
             magic = (uint32_t)strtoul(argv[++i], NULL, 16);
         } else if (!strcmp(argv[i], "--secret") && i + 1 < argc) {
             secret = argv[++i];
+        } else if (!strcmp(argv[i], "--return") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "client-edge")) {
+                ret_mode = RETURN_CLIENT_EDGE;
+            } else if (!strcmp(m, "host-virtual")) {
+                ret_mode = RETURN_HOST_VIRTUAL;
+            } else {
+                fprintf(stderr, "ukvm-host: invalid --return "
+                                "(expected client-edge or host-virtual)\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--client-size") && i + 1 < argc) {
             unsigned long w = 0, h = 0;
             if (sscanf(argv[++i], "%lux%lu", &w, &h) != 2 || w == 0 || h == 0) {
@@ -494,6 +582,7 @@ int main(int argc, char **argv) {
     memset(&g_state, 0, sizeof(g_state));
     g_state.magic = magic;
     g_state.edge  = edge;
+    g_state.ret_mode = ret_mode;
     g_state.canvas_w = client_w; /* 0 until resolved from the display below */
     g_state.canvas_h = client_h;
     pthread_mutex_init(&g_state.send_lock, NULL);
@@ -596,15 +685,24 @@ int main(int argc, char **argv) {
     CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
     CGEventTapEnable(tap, true);
 
+    g_main_runloop = CFRunLoopGetCurrent();
+
     pthread_t hb;
     pthread_create(&hb, NULL, heartbeat_thread, NULL);
 
-    fprintf(stderr, "ukvm-host: capturing; edge=%d target=%s:%u "
+    /* The client-edge return method needs us to listen for MSG_RELEASE. */
+    pthread_t rx;
+    if (ret_mode == RETURN_CLIENT_EDGE)
+        pthread_create(&rx, NULL, release_thread, NULL);
+
+    fprintf(stderr, "ukvm-host: capturing; edge=%d target=%s:%u return=%s "
                     "client-canvas=%.0fx%.0f.\n"
                     "  Move the cursor to the edge to switch to the client; "
                     "cross back out the same edge, or press Command+G, to "
                     "return.\n",
-            (int)edge, target, port, g_state.canvas_w, g_state.canvas_h);
+            (int)edge, target, port,
+            ret_mode == RETURN_CLIENT_EDGE ? "client-edge" : "host-virtual",
+            g_state.canvas_w, g_state.canvas_h);
 
     CFRunLoopRun();
 
