@@ -443,13 +443,37 @@ int main(int argc, char **argv) {
     }
 
 #if defined(__APPLE__)
-    if (!AXIsProcessTrusted()) {
+    /*
+     * Ask for accessibility access with the system prompt. Unlike the bare
+     * AXIsProcessTrusted() check, passing kAXTrustedCheckOptionPrompt makes
+     * macOS surface the "open System Settings" dialog and register this
+     * binary in the Accessibility list, so a grant can attach to this exact
+     * executable. TCC keys the grant to the binary's identity, and the
+     * running process only observes a change on a fresh launch, so the
+     * first run after granting will still report untrusted and exit; the
+     * message below tells the user to re-run.
+     */
+    CFStringRef prompt_key = kAXTrustedCheckOptionPrompt;
+    CFDictionaryRef opts = CFDictionaryCreate(
+        kCFAllocatorDefault,
+        (const void **)&prompt_key,
+        (const void **)&kCFBooleanTrue,
+        1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    Boolean trusted = AXIsProcessTrustedWithOptions(opts);
+    CFRelease(opts);
+
+    if (!trusted) {
         fprintf(stderr,
             "ukvm-host: accessibility permission is required.\n"
-            "  Grant this binary (or your terminal) access under:\n"
+            "  A system dialog may have opened; if not, open:\n"
             "    System Settings > Privacy & Security > Accessibility\n"
             "    System Settings > Privacy & Security > Input Monitoring\n"
-            "  then re-run ukvm-host.\n");
+            "  Enable the entry for THIS binary (or the terminal you launch\n"
+            "  it from). macOS binds the grant to the executable's identity,\n"
+            "  so after rebuilding ukvm-host you must re-grant it. If an old\n"
+            "  'ukvm-host' entry is present, remove it and re-add the current\n"
+            "  one. The permission only takes effect on a fresh launch, so\n"
+            "  quit and relaunch your terminal, then re-run ukvm-host.\n");
         return 1;
     }
 
