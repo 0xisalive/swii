@@ -56,6 +56,19 @@ struct host_state {
     double                screen_w;
     double                screen_h;
 
+    /*
+     * Virtual client canvas. The host cannot observe the client's real
+     * cursor, so while REMOTE it integrates the deltas it forwards into a
+     * virtual position (vx, vy) over a canvas the size of the host's main
+     * display. Crossing back out through the entry edge returns control to
+     * the host. The canvas size can be overridden for a client with a
+     * different resolution via --client-size WxH.
+     */
+    double                vx;
+    double                vy;
+    double                canvas_w;
+    double                canvas_h;
+
     pthread_mutex_t       send_lock;
 };
 
@@ -147,10 +160,52 @@ static void enter_remote(void) {
     if (g_state.remote)
         return;
     g_state.remote = true;
+
+    /*
+     * Seed the virtual cursor just inside the edge the pointer entered
+     * through, centred on the orthogonal axis. The entry edge on the client
+     * is the one opposite the host exit edge: exiting the host's right edge
+     * means arriving at the client's left side, so moving back left returns
+     * control.
+     */
+    switch (g_state.edge) {
+    case EDGE_RIGHT:  g_state.vx = 0.0;                  g_state.vy = g_state.canvas_h / 2.0; break;
+    case EDGE_LEFT:   g_state.vx = g_state.canvas_w - 1; g_state.vy = g_state.canvas_h / 2.0; break;
+    case EDGE_BOTTOM: g_state.vy = 0.0;                  g_state.vx = g_state.canvas_w / 2.0; break;
+    case EDGE_TOP:    g_state.vy = g_state.canvas_h - 1; g_state.vx = g_state.canvas_w / 2.0; break;
+    }
+
     send_heartbeat(1);
     CGDisplayHideCursor(kCGNullDirectDisplay);
     CGAssociateMouseAndMouseCursorPosition(false);
     fprintf(stderr, "ukvm-host: -> REMOTE (client has control)\n");
+}
+
+/*
+ * Integrate a forwarded mouse delta into the virtual client position and
+ * report whether the cursor has crossed back out through the entry edge.
+ * The position is clamped to the canvas on both axes so travel deep into
+ * the client does not build up an unbounded offset that would delay the
+ * return crossing.
+ */
+static bool virtual_move_returns(int16_t dx, int16_t dy) {
+    g_state.vx += (double)dx;
+    g_state.vy += (double)dy;
+
+    bool returning = false;
+    switch (g_state.edge) {
+    case EDGE_RIGHT:  returning = (g_state.vx <= 0.0); break;
+    case EDGE_LEFT:   returning = (g_state.vx >= g_state.canvas_w - 1.0); break;
+    case EDGE_BOTTOM: returning = (g_state.vy <= 0.0); break;
+    case EDGE_TOP:    returning = (g_state.vy >= g_state.canvas_h - 1.0); break;
+    }
+
+    if (g_state.vx < 0.0)                   g_state.vx = 0.0;
+    if (g_state.vx > g_state.canvas_w - 1)  g_state.vx = g_state.canvas_w - 1;
+    if (g_state.vy < 0.0)                   g_state.vy = 0.0;
+    if (g_state.vy > g_state.canvas_h - 1)  g_state.vy = g_state.canvas_h - 1;
+
+    return returning;
 }
 
 static void enter_local(void) {
@@ -213,7 +268,7 @@ static void handle_flags_changed(CGEventFlags flags) {
 }
 
 /* ----------------------------------------------------------------------- */
-/* Failsafe hotkey: Ctrl + Option + Escape                                 */
+/* Failsafe hotkey: Command + G                                            */
 /* ----------------------------------------------------------------------- */
 
 static bool is_failsafe(CGEventType type, CGEventRef event) {
@@ -222,9 +277,7 @@ static bool is_failsafe(CGEventType type, CGEventRef event) {
     CGKeyCode kc = (CGKeyCode)CGEventGetIntegerValueField(event,
                                                           kCGKeyboardEventKeycode);
     CGEventFlags f = CGEventGetFlags(event);
-    return kc == kVKX_Escape &&
-           (f & kCGEventFlagMaskControl) &&
-           (f & kCGEventFlagMaskAlternate);
+    return kc == kVKX_ANSI_G && (f & kCGEventFlagMaskCommand);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -290,6 +343,14 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
         int64_t dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
         int64_t dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
         send_mouse_move((int16_t)dx, (int16_t)dy);
+        /*
+         * Track the virtual position. If the pointer has walked back out
+         * through the entry edge, hand control back to the host. The delta
+         * that triggers the crossing is still forwarded above so the client
+         * cursor settles against its edge rather than stopping short.
+         */
+        if (virtual_move_returns((int16_t)dx, (int16_t)dy))
+            enter_local();
         return NULL;
     }
     case kCGEventLeftMouseDown:  send_mouse_btn(UKVM_BTN_LEFT, 1);  return NULL;
@@ -367,8 +428,12 @@ static void usage(const char *argv0) {
         "  --edge     screen edge that transfers control (default right)\n"
         "  --key      32-bit hex magic shared by both ends (default 0x%08X)\n"
         "  --secret   passphrase enabling ChaCha20 payload encryption\n"
+        "  --client-size WxH  client resolution for the return boundary\n"
+        "             (default: this host's main display size)\n"
         "\n"
-        "  Failsafe: Ctrl+Option+Escape always returns control to the host.\n",
+        "  Control returns to the host when the pointer crosses back out\n"
+        "  through the entry edge (e.g. the client's left side for --edge\n"
+        "  right), or at any time with the Command+G failsafe.\n",
         argv0, UKVM_PORT_DEFAULT, UKVM_PORT_DEFAULT, UKVM_MAGIC_DEFAULT);
 }
 
@@ -386,6 +451,7 @@ int main(int argc, char **argv) {
     uint16_t port = UKVM_PORT_DEFAULT;
     uint32_t magic = UKVM_MAGIC_DEFAULT;
     enum edge edge = EDGE_RIGHT;
+    double client_w = 0.0, client_h = 0.0; /* 0 = fall back to host display */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--target") && i + 1 < argc) {
@@ -401,6 +467,15 @@ int main(int argc, char **argv) {
             magic = (uint32_t)strtoul(argv[++i], NULL, 16);
         } else if (!strcmp(argv[i], "--secret") && i + 1 < argc) {
             secret = argv[++i];
+        } else if (!strcmp(argv[i], "--client-size") && i + 1 < argc) {
+            unsigned long w = 0, h = 0;
+            if (sscanf(argv[++i], "%lux%lu", &w, &h) != 2 || w == 0 || h == 0) {
+                fprintf(stderr, "ukvm-host: invalid --client-size "
+                                "(expected WxH, e.g. 1920x1080)\n");
+                return 2;
+            }
+            client_w = (double)w;
+            client_h = (double)h;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -419,6 +494,8 @@ int main(int argc, char **argv) {
     memset(&g_state, 0, sizeof(g_state));
     g_state.magic = magic;
     g_state.edge  = edge;
+    g_state.canvas_w = client_w; /* 0 until resolved from the display below */
+    g_state.canvas_h = client_h;
     pthread_mutex_init(&g_state.send_lock, NULL);
 
     ukvm_derive_key(secret, &g_state.crypto);
@@ -481,6 +558,13 @@ int main(int argc, char **argv) {
     g_state.screen_w = (double)CGDisplayPixelsWide(disp);
     g_state.screen_h = (double)CGDisplayPixelsHigh(disp);
 
+    /* Resolve the virtual client canvas: use --client-size if given, else
+     * assume the client matches this host's main display. */
+    if (g_state.canvas_w <= 0.0 || g_state.canvas_h <= 0.0) {
+        g_state.canvas_w = g_state.screen_w;
+        g_state.canvas_h = g_state.screen_h;
+    }
+
     CGEventMask mask =
         CGEventMaskBit(kCGEventMouseMoved)        |
         CGEventMaskBit(kCGEventLeftMouseDown)     |
@@ -515,9 +599,12 @@ int main(int argc, char **argv) {
     pthread_t hb;
     pthread_create(&hb, NULL, heartbeat_thread, NULL);
 
-    fprintf(stderr, "ukvm-host: capturing; edge=%d target=%s:%u. "
-                    "Move cursor to the edge to switch.\n",
-            (int)edge, target, port);
+    fprintf(stderr, "ukvm-host: capturing; edge=%d target=%s:%u "
+                    "client-canvas=%.0fx%.0f.\n"
+                    "  Move the cursor to the edge to switch to the client; "
+                    "cross back out the same edge, or press Command+G, to "
+                    "return.\n",
+            (int)edge, target, port, g_state.canvas_w, g_state.canvas_h);
 
     CFRunLoopRun();
 

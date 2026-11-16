@@ -111,11 +111,19 @@ start otherwise and prints where to click.
 | `--edge`   | `right`       | screen edge that hands control to the client   |
 | `--key`    | `0x554B564D`  | 32-bit magic shared by both ends               |
 | `--secret` | (none)        | passphrase enabling encryption                 |
+| `--client-size` | host display | client resolution `WxH` for the return boundary |
 
 Push the cursor to the configured edge to hand control to the client; the
-local cursor hides and freezes while raw deltas stream out. Cross back over
-the entry edge, or press the **Ctrl + Option + Escape** failsafe, to take
-control back.
+local cursor hides and freezes while raw deltas stream out.
+
+To take control back, move the pointer **back out through the entry edge**
+of the client. Because the host cannot see the client's real cursor, it
+integrates the deltas it sends over a virtual canvas the size of its own
+main display (override with `--client-size 1920x1080` if the client's
+resolution differs) and returns control when that virtual cursor crosses
+back out. For the default `--edge right`, control enters at the client's
+left side, so moving left until you reach it hands control back to the
+host. The **Command + G** failsafe returns control instantly from anywhere.
 
 ### FreeBSD client
 
