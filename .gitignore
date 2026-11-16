@@ -1,0 +1,9 @@
+# Build artifacts
+ukvm-host
+ukvm-client
+*.o
+*.dSYM/
+
+# Local test scratch
+rt_test
+rt_test.c
