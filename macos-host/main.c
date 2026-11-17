@@ -81,6 +81,7 @@ struct host_state {
     double                vy;
     double                canvas_w;
     double                canvas_h;
+    bool                  v_armed; /* return edge live only after dead-zone */
 
     pthread_mutex_t       send_lock;
 };
@@ -194,11 +195,12 @@ static void enter_remote(void) {
      * control.
      */
     switch (g_state.edge) {
-    case EDGE_RIGHT:  g_state.vx = 0.0;                  g_state.vy = g_state.canvas_h / 2.0; break;
-    case EDGE_LEFT:   g_state.vx = g_state.canvas_w - 1; g_state.vy = g_state.canvas_h / 2.0; break;
-    case EDGE_BOTTOM: g_state.vy = 0.0;                  g_state.vx = g_state.canvas_w / 2.0; break;
-    case EDGE_TOP:    g_state.vy = g_state.canvas_h - 1; g_state.vx = g_state.canvas_w / 2.0; break;
+    case EDGE_RIGHT:  g_state.vx = g_state.canvas_w * 0.05;       g_state.vy = g_state.canvas_h / 2.0; break;
+    case EDGE_LEFT:   g_state.vx = g_state.canvas_w * 0.95;       g_state.vy = g_state.canvas_h / 2.0; break;
+    case EDGE_BOTTOM: g_state.vy = g_state.canvas_h * 0.05;       g_state.vx = g_state.canvas_w / 2.0; break;
+    case EDGE_TOP:    g_state.vy = g_state.canvas_h * 0.95;       g_state.vx = g_state.canvas_w / 2.0; break;
     }
+    g_state.v_armed = false;
 
     send_heartbeat(1);
     CGDisplayHideCursor(kCGNullDirectDisplay);
@@ -217,20 +219,34 @@ static bool virtual_move_returns(int16_t dx, int16_t dy) {
     g_state.vx += (double)dx;
     g_state.vy += (double)dy;
 
-    bool returning = false;
-    switch (g_state.edge) {
-    case EDGE_RIGHT:  returning = (g_state.vx <= 0.0); break;
-    case EDGE_LEFT:   returning = (g_state.vx >= g_state.canvas_w - 1.0); break;
-    case EDGE_BOTTOM: returning = (g_state.vy <= 0.0); break;
-    case EDGE_TOP:    returning = (g_state.vy >= g_state.canvas_h - 1.0); break;
-    }
-
     if (g_state.vx < 0.0)                   g_state.vx = 0.0;
     if (g_state.vx > g_state.canvas_w - 1)  g_state.vx = g_state.canvas_w - 1;
     if (g_state.vy < 0.0)                   g_state.vy = 0.0;
     if (g_state.vy > g_state.canvas_h - 1)  g_state.vy = g_state.canvas_h - 1;
 
-    return returning;
+    double arm_x = g_state.canvas_w * 0.25;
+    double arm_y = g_state.canvas_h * 0.25;
+
+    /* Arm only once the cursor has moved into the client past the dead-zone,
+     * so the seed position near the entry edge cannot trigger an immediate
+     * return. Matches the client-edge method's behaviour. */
+    if (!g_state.v_armed) {
+        switch (g_state.edge) {
+        case EDGE_RIGHT:  if (g_state.vx >= arm_x)                       g_state.v_armed = true; break;
+        case EDGE_LEFT:   if (g_state.vx <= g_state.canvas_w - 1 - arm_x) g_state.v_armed = true; break;
+        case EDGE_BOTTOM: if (g_state.vy >= arm_y)                       g_state.v_armed = true; break;
+        case EDGE_TOP:    if (g_state.vy <= g_state.canvas_h - 1 - arm_y) g_state.v_armed = true; break;
+        }
+        return false;
+    }
+
+    switch (g_state.edge) {
+    case EDGE_RIGHT:  return (g_state.vx <= 0.0);
+    case EDGE_LEFT:   return (g_state.vx >= g_state.canvas_w - 1.0);
+    case EDGE_BOTTOM: return (g_state.vy <= 0.0);
+    case EDGE_TOP:    return (g_state.vy >= g_state.canvas_h - 1.0);
+    }
+    return false;
 }
 
 static void enter_local(void) {
@@ -455,10 +471,15 @@ static void *release_thread(void *arg) {
     (void)arg;
     for (;;) {
         uint8_t buf[UKVM_MAX_PACKET];
-        ssize_t n = recvfrom(g_state.sock, buf, sizeof(buf), 0, NULL, NULL);
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n = recvfrom(g_state.sock, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&from, &fromlen);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
+            fprintf(stderr, "ukvm-host: release recvfrom: %s\n",
+                    strerror(errno));
             break;
         }
         if ((size_t)n < sizeof(struct ukvm_header))
@@ -470,11 +491,15 @@ static void *release_thread(void *arg) {
         if (hdr.magic != g_state.magic || hdr.version != UKVM_VERSION)
             continue;
 
-        if (hdr.type == MSG_RELEASE && g_state.remote) {
-            CFRunLoopPerformBlock(g_main_runloop, kCFRunLoopCommonModes, ^{
-                enter_local();
-            });
-            CFRunLoopWakeUp(g_main_runloop);
+        if (hdr.type == MSG_RELEASE) {
+            fprintf(stderr, "ukvm-host: received MSG_RELEASE from %s:%u\n",
+                    inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            if (g_state.remote) {
+                CFRunLoopPerformBlock(g_main_runloop, kCFRunLoopCommonModes, ^{
+                    enter_local();
+                });
+                CFRunLoopWakeUp(g_main_runloop);
+            }
         }
     }
     return NULL;
@@ -606,6 +631,27 @@ int main(int argc, char **argv) {
     if (inet_pton(AF_INET, target, &g_state.dst.sin_addr) != 1) {
         fprintf(stderr, "ukvm-host: invalid --target address '%s'\n", target);
         return 2;
+    }
+
+    /*
+     * Bind the local side to the same well-known port. Without this the
+     * kernel assigns an ephemeral source port on the first send, and the
+     * client's MSG_RELEASE (addressed to that learned source) must traverse
+     * an unpredictable, often firewalled, port. Binding makes the reverse
+     * channel symmetric: both ends speak on <port>.
+     */
+    {
+        int one = 1;
+        setsockopt(g_state.sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in local;
+        memset(&local, 0, sizeof(local));
+        local.sin_family      = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_ANY);
+        local.sin_port        = htons(port);
+        if (bind(g_state.sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            perror("ukvm-host: bind");
+            return 1;
+        }
     }
 
 #if defined(__APPLE__)

@@ -150,6 +150,17 @@ Both ends should agree: run the host with `--return client-edge` (default)
 and the client with `--screen-size`, or run the host with
 `--return host-virtual` and omit the client's `--screen-size`.
 
+In both methods the return edge is armed only after the pointer has moved
+about a quarter of the screen away from where it entered. This dead-zone
+keeps the entry position, which sits right next to the return edge, from
+handing control straight back; you must move into the client first, then
+return to the edge to come back.
+
+The reverse `MSG_RELEASE` travels on the same UDP port as the forward
+stream: the host binds the local side to `--port` so the client can always
+reach it, rather than replying to an unpredictable ephemeral port. Open
+that one UDP port both directions on any firewall between the machines.
+
 ### FreeBSD client
 
 Load the module and make sure `/dev/uinput` is writable:

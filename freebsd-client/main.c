@@ -94,6 +94,10 @@ struct client_state {
     double   y;
     uint8_t  entry_edge;             /* enum ukvm_edge, the host exit edge */
     bool     have_edge;
+    bool     armed;                  /* return edge live only after the
+                                      * cursor has moved into the client past
+                                      * a dead-zone, so the seed position does
+                                      * not trigger an immediate release */
 
     uint16_t tx_seq;                 /* sequence for packets we send back */
     struct sockaddr_in host_addr;    /* learned from the first valid packet */
@@ -269,8 +273,15 @@ static void send_release(void) {
     ssize_t n = sendto(g_state.sock, buf, sizeof(buf), 0,
                        (struct sockaddr *)&g_state.host_addr,
                        sizeof(g_state.host_addr));
-    if (n < 0 && errno != EINTR)
+    if (n < 0 && errno != EINTR) {
         fprintf(stderr, "ukvm-client: sendto(release): %s\n", strerror(errno));
+    } else {
+        fprintf(stderr, "ukvm-client: reached entry edge, sent MSG_RELEASE "
+                        "to %s:%u\n",
+                inet_ntoa(g_state.host_addr.sin_addr),
+                ntohs(g_state.host_addr.sin_port));
+    }
+    g_state.active = false; /* locally release; host will confirm via heartbeat */
 }
 
 /*
@@ -279,6 +290,16 @@ static void send_release(void) {
  * meaning control should be handed back. Only meaningful when edge_return
  * is enabled and the entry edge is known.
  */
+/*
+ * Fraction of the screen the cursor must travel away from the entry edge
+ * before the return trigger is armed. Entering from the right seeds the
+ * cursor at the client's left side; without this dead-zone the seed itself
+ * already satisfies the "back at the left edge" condition and control would
+ * snap straight back. Arming requires the user to move meaningfully into
+ * the client first.
+ */
+#define UKVM_ARM_FRACTION 0.25
+
 static bool edge_reached(int16_t dx, int16_t dy) {
     if (!g_state.edge_return || !g_state.have_edge)
         return false;
@@ -291,6 +312,22 @@ static bool edge_reached(int16_t dx, int16_t dy) {
     if (g_state.y < 0.0)                   g_state.y = 0.0;
     if (g_state.y > g_state.screen_h - 1)  g_state.y = g_state.screen_h - 1;
 
+    double arm_x = g_state.screen_w * UKVM_ARM_FRACTION;
+    double arm_y = g_state.screen_h * UKVM_ARM_FRACTION;
+
+    /* Arm once the cursor has moved past the dead-zone, away from the entry
+     * edge; only then can a return to that edge hand control back. */
+    if (!g_state.armed) {
+        switch (g_state.entry_edge) {
+        case UKVM_EDGE_RIGHT:  if (g_state.x >= arm_x)                      g_state.armed = true; break;
+        case UKVM_EDGE_LEFT:   if (g_state.x <= g_state.screen_w - 1 - arm_x) g_state.armed = true; break;
+        case UKVM_EDGE_BOTTOM: if (g_state.y >= arm_y)                      g_state.armed = true; break;
+        case UKVM_EDGE_TOP:    if (g_state.y <= g_state.screen_h - 1 - arm_y) g_state.armed = true; break;
+        default: break;
+        }
+        return false;
+    }
+
     switch (g_state.entry_edge) {
     case UKVM_EDGE_RIGHT:  return g_state.x <= 0.0;                 /* exit left */
     case UKVM_EDGE_LEFT:   return g_state.x >= g_state.screen_w - 1.0;
@@ -300,15 +337,23 @@ static bool edge_reached(int16_t dx, int16_t dy) {
     }
 }
 
-/* Seed the absolute position at the entry edge when control is grabbed. */
+/*
+ * Seed the absolute position a short distance inside the entry edge when
+ * control is grabbed, and disarm the return trigger until the cursor has
+ * travelled into the client (see edge_reached).
+ */
 static void seed_edge_position(void) {
+    double inset_x = g_state.screen_w * 0.05;
+    double inset_y = g_state.screen_h * 0.05;
+
     switch (g_state.entry_edge) {
-    case UKVM_EDGE_RIGHT:  g_state.x = 0.0;                 g_state.y = g_state.screen_h / 2.0; break;
-    case UKVM_EDGE_LEFT:   g_state.x = g_state.screen_w - 1; g_state.y = g_state.screen_h / 2.0; break;
-    case UKVM_EDGE_BOTTOM: g_state.y = 0.0;                 g_state.x = g_state.screen_w / 2.0; break;
-    case UKVM_EDGE_TOP:    g_state.y = g_state.screen_h - 1; g_state.x = g_state.screen_w / 2.0; break;
+    case UKVM_EDGE_RIGHT:  g_state.x = inset_x;                      g_state.y = g_state.screen_h / 2.0; break;
+    case UKVM_EDGE_LEFT:   g_state.x = g_state.screen_w - 1 - inset_x; g_state.y = g_state.screen_h / 2.0; break;
+    case UKVM_EDGE_BOTTOM: g_state.y = inset_y;                      g_state.x = g_state.screen_w / 2.0; break;
+    case UKVM_EDGE_TOP:    g_state.y = g_state.screen_h - 1 - inset_y; g_state.x = g_state.screen_w / 2.0; break;
     default: break;
     }
+    g_state.armed = false;
 }
 
 /* ----------------------------------------------------------------------- */
